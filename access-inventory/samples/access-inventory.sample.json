@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "0.1",
+  "generatedAt": "2026-06-30T00:00:00Z",
+  "target": {"displayName":"홍길동","userPrincipalName":"hong@contoso.com","userType":"Member","companyName":"Contoso","accountEnabled":true},
+  "collection": {"status":"sample","tool":"none"},
+  "inventory": {
+    "entra": {"directMembership":[{"@odata.type":"#microsoft.graph.group","displayName":"IT-Admin","id":"group-1"}],"transitiveMembership":[],"ownedObjects":[],"appRoleAssignments":[],"pimActiveRoleAssignments":[]},
+    "azure": {"assignments":[]},
+    "sharePointOneDrive": {"collectionScope":"샘플 데이터"},
+    "errors": []
+  }
+}
