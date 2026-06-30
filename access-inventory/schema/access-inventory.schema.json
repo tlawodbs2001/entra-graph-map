@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Entra Access Inventory result",
+  "type": "object",
+  "required": ["schemaVersion", "generatedAt", "target", "collection", "inventory"],
+  "properties": {
+    "schemaVersion": {"type": "string"},
+    "generatedAt": {"type": "string"},
+    "target": {"type": "object"},
+    "collection": {"type": "object"},
+    "inventory": {
+      "type": "object",
+      "properties": {
+        "entra": {"type": "object"},
+        "azure": {"type": "object"},
+        "sharePointOneDrive": {"type": "object"},
+        "errors": {"type": "array"}
+      }
+    }
+  }
+}
