@@ -1,0 +1,7 @@
+output/
+*.token
+*.secret
+*.pfx
+*.pem
+*.key
+*.json.user
