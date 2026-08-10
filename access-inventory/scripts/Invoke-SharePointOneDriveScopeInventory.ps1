@@ -3,18 +3,12 @@ param(
     [Parameter(Mandatory)]
     [ValidateSet('Drive')]
     [string]$ScopeType,
-
-    [Parameter(Mandatory)]
-    [string]$DriveId,
-
+    [Parameter(Mandatory)][string]$DriveId,
     [Parameter(Mandatory)]
     [ValidatePattern('^[^\s@]+@[^\s@]+\.[^\s@]+$')]
     [string]$TargetUserPrincipalName,
-
     [string]$OutputRoot = 'C:\scripts\entra-access-inventory\output',
-
-    [ValidateRange(1, 100000)]
-    [int]$MaxItems = 500
+    [ValidateRange(1, 100000)][int]$MaxItems = 500
 )
 
 Set-StrictMode -Version Latest
@@ -41,6 +35,7 @@ function Ensure-GraphConnection {
     $currentScopes = if ($ctx) { @($ctx.Scopes) } else { @() }
     $missingScopes = @($Scopes | Where-Object { $currentScopes -notcontains $_ })
     if (-not $ctx -or -not $ctx.Account -or $missingScopes.Count -gt 0) {
+        if ($ctx) { try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {} }
         Connect-MgGraph -Scopes $Scopes -UseDeviceCode -ContextScope Process -NoWelcome | Out-Null
     }
 }
@@ -64,17 +59,17 @@ function Get-GraphCollection {
 
     $result = [System.Collections.Generic.List[object]]::new()
     $next = $Uri
-    while ($next) {
+    while (-not [string]::IsNullOrWhiteSpace([string]$next)) {
         $response = Invoke-MgGraphRequest -Method GET -Uri $next -ErrorAction Stop
-        foreach ($entry in @(Get-GraphPropertyValue -Object $response -Name 'value')) {
-            $result.Add($entry)
-        }
+        foreach ($entry in @(Get-GraphPropertyValue -Object $response -Name 'value')) { $result.Add($entry) }
         $next = [string](Get-GraphPropertyValue -Object $response -Name '@odata.nextLink')
     }
     return @($result)
 }
 
-Ensure-GraphConnection -Scopes @('Files.Read.All', 'Sites.Read.All')
+# Arbitrary drive inventory requires tenant-wide file read capability in the intended admin scenario.
+# Sites.Read.All is not additionally requested because Files.Read.All is sufficient for these DriveItem calls.
+Ensure-GraphConnection -Scopes @('Files.Read.All')
 
 $safe = ($TargetUserPrincipalName -replace '[^a-zA-Z0-9._-]', '_')
 $outDir = Join-Path $OutputRoot $safe
@@ -103,7 +98,7 @@ try {
             $errors.Add([pscustomobject]@{
                 scope = "driveItem.permissions:$($item.id)"
                 message = $_.Exception.Message
-                remediation = 'Files.Read.All 또는 Sites.Read.All 권한과 해당 Drive 접근 권한을 확인하십시오.'
+                remediation = 'Files.Read.All 권한과 해당 Drive 접근 가능 여부를 확인하십시오.'
             })
         }
 
@@ -153,7 +148,7 @@ catch {
     $errors.Add([pscustomobject]@{
         scope = 'sharepointOneDrive.scopeInventory'
         message = $_.Exception.Message
-        remediation = 'Drive ID, Graph PowerShell 로그인 상태, Files/Sites 읽기 권한을 확인하십시오.'
+        remediation = 'Drive ID, Graph PowerShell 로그인 상태, Files.Read.All 권한을 확인하십시오.'
     })
 }
 
