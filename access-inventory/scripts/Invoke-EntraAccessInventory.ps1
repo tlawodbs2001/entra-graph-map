@@ -15,47 +15,107 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
 function New-SafeFileName {
     param([Parameter(Mandatory)][string]$Value)
     return ($Value -replace '[^a-zA-Z0-9._-]', '_')
 }
 
-function Invoke-MgcJson {
+function Assert-GraphSdkAvailable {
+    $required = @('Connect-MgGraph', 'Get-MgContext', 'Invoke-MgGraphRequest')
+    $missing = @($required | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+    if ($missing.Count -gt 0) {
+        try { Import-Module Microsoft.Graph.Authentication -ErrorAction Stop } catch {}
+        $missing = @($required | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+    }
+    if ($missing.Count -gt 0) {
+        throw "Microsoft Graph PowerShell SDK가 필요합니다. 누락 명령: $($missing -join ', '). 설치 예: Install-Module Microsoft.Graph -Scope CurrentUser"
+    }
+}
+
+function Ensure-GraphConnection {
+    param([Parameter(Mandatory)][string[]]$Scopes)
+
+    Assert-GraphSdkAvailable
+    $ctx = Get-MgContext -ErrorAction SilentlyContinue
+    $currentScopes = if ($ctx) { @($ctx.Scopes) } else { @() }
+    $missingScopes = @($Scopes | Where-Object { $currentScopes -notcontains $_ })
+
+    if (-not $ctx -or -not $ctx.Account -or $missingScopes.Count -gt 0) {
+        Connect-MgGraph -Scopes $Scopes -UseDeviceCode -ContextScope Process -NoWelcome | Out-Null
+    }
+}
+
+function Get-GraphPropertyValue {
+    param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($key in $Object.Keys) {
+            if ([string]$key -ieq $Name) { return $Object[$key] }
+        }
+        return $null
+    }
+    $property = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $Name } | Select-Object -First 1
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function Invoke-GraphRequestSafe {
     param(
-        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][string]$Operation,
         [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Errors
     )
 
     try {
-        $raw = & mgc @Arguments --output JSON 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw ($raw | Out-String)
-        }
-        $text = ($raw | Out-String).Trim()
-        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
-        return ($text | ConvertFrom-Json -Depth 100)
+        return Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop
     }
     catch {
         $Errors.Add([pscustomobject]@{
             scope = $Operation
             message = $_.Exception.Message
-            remediation = 'mgc 로그인 상태, Graph 권한, 대상 사용자 존재 여부를 확인하십시오.'
+            remediation = 'Graph PowerShell 로그인 상태, delegated 권한, 대상 객체 존재 여부를 확인하십시오.'
         })
         return $null
     }
 }
 
-function Get-GraphValueArray {
-    param($Response)
-    if ($null -eq $Response) { return @() }
-    if ($Response.PSObject.Properties.Name -contains 'value') { return @($Response.value) }
-    return @($Response)
+function Invoke-GraphCollectionSafe {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$Operation,
+        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Errors
+    )
+
+    $items = [System.Collections.Generic.List[object]]::new()
+    $next = $Uri
+    try {
+        while ($next) {
+            $response = Invoke-MgGraphRequest -Method GET -Uri $next -ErrorAction Stop
+            foreach ($item in @(Get-GraphPropertyValue -Object $response -Name 'value')) {
+                $items.Add($item)
+            }
+            $next = [string](Get-GraphPropertyValue -Object $response -Name '@odata.nextLink')
+        }
+        return @($items)
+    }
+    catch {
+        $Errors.Add([pscustomobject]@{
+            scope = $Operation
+            message = $_.Exception.Message
+            remediation = 'Graph PowerShell 로그인 상태, delegated 권한, Graph 페이징 응답을 확인하십시오.'
+        })
+        return @($items)
+    }
 }
 
-if (-not (Get-Command mgc -ErrorAction SilentlyContinue)) {
-    throw 'mgc를 찾을 수 없습니다. Microsoft Graph CLI 설치 및 PATH 등록 후 다시 실행하십시오.'
+function Assert-AzPowerShellAvailable {
+    $required = @('Get-AzContext', 'Connect-AzAccount', 'Get-AzSubscription', 'Set-AzContext', 'Get-AzRoleAssignment')
+    $missing = @($required | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+    if ($missing.Count -gt 0) {
+        throw "Azure PowerShell 모듈이 필요합니다. 누락 명령: $($missing -join ', '). Az.Accounts와 Az.Resources 설치 여부를 확인하십시오."
+    }
 }
 
 $errors = [System.Collections.Generic.List[object]]::new()
@@ -63,114 +123,126 @@ $safeUpn = New-SafeFileName -Value $UserPrincipalName
 $outDir = Join-Path $OutputRoot $safeUpn
 New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
-try { & mgc profile show | Out-Null } catch { }
+$scopes = [System.Collections.Generic.List[string]]::new()
+foreach ($scope in @('User.Read.All', 'Group.Read.All', 'Directory.Read.All', 'Files.Read.All')) { $scopes.Add($scope) }
+if (-not $SkipPim) { $scopes.Add('RoleManagement.Read.Directory') }
+Ensure-GraphConnection -Scopes @($scopes | Select-Object -Unique)
 
-$user = Invoke-MgcJson -Arguments @(
-    'users','with-user-principal-name','--user-principal-name',$UserPrincipalName,
-    'get','--select','id,displayName,userPrincipalName,accountEnabled,createdDateTime,companyName,userType'
-) -Operation 'entra.user' -Errors $errors
+$encodedUpn = [uri]::EscapeDataString($UserPrincipalName)
+$user = Invoke-GraphRequestSafe `
+    -Uri "https://graph.microsoft.com/v1.0/users/$encodedUpn?`$select=id,displayName,userPrincipalName,accountEnabled,createdDateTime,companyName,userType" `
+    -Operation 'entra.user' `
+    -Errors $errors
 
-if ($null -eq $user -or [string]::IsNullOrWhiteSpace($user.id)) {
+if ($null -eq $user -or [string]::IsNullOrWhiteSpace([string]$user.id)) {
     $result = [ordered]@{
-        schemaVersion = '0.1'
+        schemaVersion = '0.2'
         generatedAt = (Get-Date).ToUniversalTime().ToString('o')
         target = [ordered]@{ userPrincipalName = $UserPrincipalName }
-        collection = [ordered]@{ status = 'failed'; tool = 'mgc'; errors = @($errors) }
+        collection = [ordered]@{ status = 'failed'; tool = 'Microsoft Graph PowerShell SDK'; errors = @($errors) }
         inventory = [ordered]@{ entra = @{}; azure = @{}; sharePointOneDrive = @{}; errors = @($errors) }
     }
     $result | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath (Join-Path $outDir 'access-inventory.json') -Encoding utf8
     throw "대상 사용자를 조회하지 못했습니다. 결과 파일: $outDir\access-inventory.json"
 }
 
-$memberOf = Invoke-MgcJson -Arguments @(
-    'users','with-user-principal-name','--user-principal-name',$UserPrincipalName,
-    'member-of','list','--all'
-) -Operation 'entra.memberOf' -Errors $errors
+$userId = [string]$user.id
+$memberOf = Invoke-GraphCollectionSafe `
+    -Uri "https://graph.microsoft.com/v1.0/users/$userId/memberOf?`$top=999" `
+    -Operation 'entra.memberOf' -Errors $errors
 
-$transitiveMemberOf = $null
+$transitiveMemberOf = @()
 if ($IncludeTransitiveMembership) {
-    $transitiveMemberOf = Invoke-MgcJson -Arguments @(
-        'users','with-user-principal-name','--user-principal-name',$UserPrincipalName,
-        'transitive-member-of','list','--all'
-    ) -Operation 'entra.transitiveMemberOf' -Errors $errors
+    $transitiveMemberOf = Invoke-GraphCollectionSafe `
+        -Uri "https://graph.microsoft.com/v1.0/users/$userId/transitiveMemberOf?`$top=999" `
+        -Operation 'entra.transitiveMemberOf' -Errors $errors
 }
 
-$ownedObjects = Invoke-MgcJson -Arguments @(
-    'users','with-user-principal-name','--user-principal-name',$UserPrincipalName,
-    'owned-objects','list','--all'
-) -Operation 'entra.ownedObjects' -Errors $errors
+$ownedObjects = Invoke-GraphCollectionSafe `
+    -Uri "https://graph.microsoft.com/v1.0/users/$userId/ownedObjects?`$top=999" `
+    -Operation 'entra.ownedObjects' -Errors $errors
 
-$appRoleAssignments = Invoke-MgcJson -Arguments @(
-    'users','with-user-principal-name','--user-principal-name',$UserPrincipalName,
-    'app-role-assignments','list','--all'
-) -Operation 'entra.appRoleAssignments' -Errors $errors
+$appRoleAssignments = Invoke-GraphCollectionSafe `
+    -Uri "https://graph.microsoft.com/v1.0/users/$userId/appRoleAssignments?`$top=999" `
+    -Operation 'entra.appRoleAssignments' -Errors $errors
 
-$drive = Invoke-MgcJson -Arguments @(
-    'users','with-user-principal-name','--user-principal-name',$UserPrincipalName,
-    'drive','get','--select','id,driveType,webUrl,quota,owner'
-) -Operation 'onedrive.drive' -Errors $errors
+$drive = Invoke-GraphRequestSafe `
+    -Uri "https://graph.microsoft.com/v1.0/users/$userId/drive?`$select=id,driveType,webUrl,quota,owner" `
+    -Operation 'onedrive.drive' -Errors $errors
 
-$pimActive = $null
+$pimActive = @()
 if (-not $SkipPim) {
-    $pimActive = Invoke-MgcJson -Arguments @(
-        'role-management','directory','role-assignment-schedule-instances','list','--all',
-        '--filter',"principalId eq '$($user.id)'",
-        '--expand','roleDefinition($select=id,displayName)'
-    ) -Operation 'entra.pimActive' -Errors $errors
+    $filter = [uri]::EscapeDataString("principalId eq '$userId'")
+    $expand = [uri]::EscapeDataString('roleDefinition($select=id,displayName)')
+    $pimActive = Invoke-GraphCollectionSafe `
+        -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances?`$filter=$filter&`$expand=$expand&`$top=999" `
+        -Operation 'entra.pimActive' -Errors $errors
 }
 
 $azureAssignments = @()
 $azureCollection = [ordered]@{ attempted = [bool]$IncludeAzure; status = 'notRequested'; subscriptions = @(); assignments = @() }
 if ($IncludeAzure) {
-    if (Get-Command az -ErrorAction SilentlyContinue) {
-        try {
-            $accountsText = & az account list --all --output json 2>&1
-            if ($LASTEXITCODE -ne 0) { throw ($accountsText | Out-String) }
-            $accounts = $accountsText | ConvertFrom-Json -Depth 20
-            $azureCollection.status = 'completed'
-            foreach ($account in @($accounts | Where-Object { $_.state -eq 'Enabled' })) {
-                $subId = $account.id
-                $azureCollection.subscriptions += [pscustomobject]@{ id = $subId; name = $account.name; tenantId = $account.tenantId }
-                $raw = & az role assignment list --assignee-object-id $user.id --subscription $subId --all --include-inherited --output json 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    $errors.Add([pscustomobject]@{ scope = "azure.rbac.$subId"; message = ($raw | Out-String); remediation = '구독 Reader 이상 권한 및 az 로그인 컨텍스트를 확인하십시오.' })
-                    continue
+    try {
+        Assert-AzPowerShellAvailable
+        $azContext = Get-AzContext -ErrorAction SilentlyContinue
+        if (-not $azContext -or -not $azContext.Account) {
+            Connect-AzAccount -ErrorAction Stop | Out-Null
+        }
+
+        $subscriptions = @(Get-AzSubscription -ErrorAction Stop | Where-Object { $_.State -eq 'Enabled' })
+        $azureCollection.status = 'completed'
+        foreach ($subscription in $subscriptions) {
+            try {
+                $subscription | Set-AzContext -ErrorAction Stop | Out-Null
+                $subId = [string]$subscription.Id
+                $azureCollection.subscriptions += [pscustomobject]@{
+                    id = $subId
+                    name = $subscription.Name
+                    tenantId = [string]$subscription.TenantId
                 }
-                $items = $raw | ConvertFrom-Json -Depth 50
-                foreach ($item in @($items)) {
+
+                $assignments = @(Get-AzRoleAssignment -ObjectId $userId -Scope "/subscriptions/$subId" -ErrorAction Stop)
+                foreach ($item in $assignments) {
                     $azureAssignments += [pscustomobject]@{
                         subscriptionId = $subId
-                        subscriptionName = $account.name
-                        roleName = $item.roleDefinitionName
-                        scope = $item.scope
-                        principalType = $item.principalType
-                        assignmentType = $item.assignmentType
-                        description = $item.description
-                        isOwner = ($item.roleDefinitionName -eq 'Owner')
+                        subscriptionName = $subscription.Name
+                        roleName = $item.RoleDefinitionName
+                        scope = $item.Scope
+                        principalType = $item.ObjectType
+                        assignmentType = 'AzureRBAC'
+                        description = $item.Description
+                        isOwner = ($item.RoleDefinitionName -eq 'Owner')
                     }
                 }
             }
-            $azureCollection.assignments = @($azureAssignments)
+            catch {
+                $errors.Add([pscustomobject]@{
+                    scope = "azure.rbac.$($subscription.Id)"
+                    message = $_.Exception.Message
+                    remediation = '해당 구독 컨텍스트와 Reader 이상 조회 권한, Az.Resources 모듈 상태를 확인하십시오.'
+                })
+            }
         }
-        catch {
-            $azureCollection.status = 'partialOrFailed'
-            $errors.Add([pscustomobject]@{ scope = 'azure.rbac'; message = $_.Exception.Message; remediation = 'az login, 구독 목록 조회 권한, 각 구독 Reader 권한을 확인하십시오.' })
-        }
+        $azureCollection.assignments = @($azureAssignments)
     }
-    else {
-        $azureCollection.status = 'azNotFound'
-        $errors.Add([pscustomobject]@{ scope = 'azure.rbac'; message = 'az CLI를 찾을 수 없습니다.'; remediation = 'Azure CLI 설치 또는 Azure RBAC 수집 생략을 선택하십시오.' })
+    catch {
+        $azureCollection.status = 'partialOrFailed'
+        $errors.Add([pscustomobject]@{
+            scope = 'azure.rbac'
+            message = $_.Exception.Message
+            remediation = 'Azure PowerShell 로그인, Az.Accounts/Az.Resources 모듈, 구독 조회 권한을 확인하십시오.'
+        })
     }
 }
 
-$directMembership = Get-GraphValueArray $memberOf
-$transitiveMembership = Get-GraphValueArray $transitiveMemberOf
-$owners = Get-GraphValueArray $ownedObjects
-$appRoles = Get-GraphValueArray $appRoleAssignments
-$pim = Get-GraphValueArray $pimActive
+$directMembership = @($memberOf)
+$transitiveMembership = @($transitiveMemberOf)
+$owners = @($ownedObjects)
+$appRoles = @($appRoleAssignments)
+$pim = @($pimActive)
 
 $result = [ordered]@{
-    schemaVersion = '0.1'
+    schemaVersion = '0.2'
     generatedAt = (Get-Date).ToUniversalTime().ToString('o')
     target = [ordered]@{
         id = $user.id
@@ -183,8 +255,12 @@ $result = [ordered]@{
     }
     collection = [ordered]@{
         status = 'completedWithPossiblePartialResults'
-        tool = 'mgc + optional az'
-        flags = [ordered]@{ includeAzure = [bool]$IncludeAzure; includeTransitiveMembership = [bool]$IncludeTransitiveMembership; skipPim = [bool]$SkipPim }
+        tool = 'Microsoft Graph PowerShell SDK + optional Azure PowerShell'
+        flags = [ordered]@{
+            includeAzure = [bool]$IncludeAzure
+            includeTransitiveMembership = [bool]$IncludeTransitiveMembership
+            skipPim = [bool]$SkipPim
+        }
         outputDirectory = $outDir
     }
     inventory = [ordered]@{
@@ -198,7 +274,7 @@ $result = [ordered]@{
         azure = $azureCollection
         sharePointOneDrive = [ordered]@{
             drive = $drive
-            collectionScope = 'OneDrive drive metadata only. Use Invoke-SharePointOneDriveScopeInventory.ps1 for a specified site or drive.'
+            collectionScope = 'OneDrive drive metadata only. Use Invoke-SharePointOneDriveScopeInventory.ps1 for a specified drive.'
         }
         errors = @($errors)
     }
