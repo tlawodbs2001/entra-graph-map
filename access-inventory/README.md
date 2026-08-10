@@ -11,17 +11,43 @@
 - 사용자에게 직접 할당된 엔터프라이즈 앱 역할
 - PIM 활성 역할(권한·역할 조건이 충족되는 경우)
 - OneDrive 드라이브 기본 정보
-- Azure RBAC(로컬 `az` CLI가 있고 로그인된 경우)
-- SharePoint/OneDrive는 지정 드라이브 또는 사이트 범위 조사 스크립트로 분리
+- Azure RBAC(Azure PowerShell 사용)
+- SharePoint/OneDrive 지정 드라이브 범위 조사
 - JSON 결과를 `ui/index.html`에 불러와 오프라인으로 확인
 
 ## 실행 전제
 
-- `mgc` 로그인 완료
-- 다른 사용자의 디렉터리 멤버십을 읽으려면 일반적으로 `User.Read.All` 또는 `Directory.Read.All` 계열 권한이 필요합니다.
-- PIM 활성 역할은 `RoleAssignmentSchedule.Read.Directory`와 지원되는 Entra 역할이 필요합니다.
-- Azure RBAC 수집은 `az login` 및 대상 구독에 대한 읽기 권한이 필요합니다.
-- SharePoint/OneDrive 파일 권한은 범위를 지정해야 합니다. 특정 사용자가 접근 가능한 테넌트 전체 파일을 역으로 완전 열거하는 단일 API는 제공되지 않습니다.
+- PowerShell 7 권장
+- Microsoft Graph PowerShell SDK
+- Azure RBAC 수집 시 Azure PowerShell `Az.Accounts`, `Az.Resources`
+
+Graph SDK가 없으면 예를 들어 다음과 같이 설치합니다.
+
+```powershell
+Install-Module Microsoft.Graph -Scope CurrentUser
+```
+
+Azure 기능을 사용할 경우 필요한 모듈 예시:
+
+```powershell
+Install-Module Az.Accounts -Scope CurrentUser
+Install-Module Az.Resources -Scope CurrentUser
+```
+
+스크립트는 필요한 경우 `Connect-MgGraph -UseDeviceCode`로 Graph 세션을 연결합니다. Azure 수집을 요청했고 현재 Azure PowerShell 세션이 없으면 `Connect-AzAccount`를 사용합니다.
+
+주요 읽기 권한:
+
+```text
+User.Read.All
+Group.Read.All
+Directory.Read.All
+Files.Read.All
+RoleManagement.Read.Directory  # PIM 조회 시
+Sites.Read.All                 # Drive 범위 조사 시
+```
+
+실제 테넌트 정책과 관리자 동의 상태에 따라 일부 권한은 사전 승인이 필요할 수 있습니다.
 
 ## 실행 예시
 
@@ -31,11 +57,41 @@ cd C:\scripts\entra-access-inventory\scripts
 .\Invoke-EntraAccessInventory.ps1 -UserPrincipalName user@contoso.com -IncludeAzure
 ```
 
+Graph만 수집:
+
+```powershell
+.\Invoke-EntraAccessInventory.ps1 -UserPrincipalName user@contoso.com
+```
+
+PIM을 제외해서 최소 범위로 실행:
+
+```powershell
+.\Invoke-EntraAccessInventory.ps1 -UserPrincipalName user@contoso.com -SkipPim
+```
+
+지정 Drive 권한 조사:
+
+```powershell
+.\Invoke-SharePointOneDriveScopeInventory.ps1 `
+  -ScopeType Drive `
+  -DriveId "<drive-id>" `
+  -TargetUserPrincipalName "user@contoso.com"
+```
+
 결과 기본 경로:
 
 ```text
 C:\scripts\entra-access-inventory\output\<UPN_안전한파일명>\access-inventory.json
 ```
+
+## 구현 기준
+
+- Microsoft Graph CLI(`mgc`) 사용 안 함
+- Azure CLI(`az`) 사용 안 함
+- Microsoft Graph PowerShell SDK 사용
+- Azure 기능은 Azure PowerShell 사용
+- Secret, Token, Client Secret을 스크립트나 저장소에 저장하지 않음
+- 조회 전용 유지
 
 ## UI 사용
 

@@ -3,39 +3,73 @@ param(
     [Parameter(Mandatory)]
     [ValidateSet('Drive')]
     [string]$ScopeType,
-
-    [Parameter(Mandatory)]
-    [string]$DriveId,
-
+    [Parameter(Mandatory)][string]$DriveId,
     [Parameter(Mandatory)]
     [ValidatePattern('^[^\s@]+@[^\s@]+\.[^\s@]+$')]
     [string]$TargetUserPrincipalName,
-
     [string]$OutputRoot = 'C:\scripts\entra-access-inventory\output',
-
-    [int]$MaxItems = 500
+    [ValidateRange(1, 100000)][int]$MaxItems = 500
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
-function Invoke-MgcJson {
-    param([string[]]$Arguments)
-    $raw = & mgc @Arguments --output JSON 2>&1
-    if ($LASTEXITCODE -ne 0) { throw ($raw | Out-String) }
-    $text = ($raw | Out-String).Trim()
-    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
-    return $text | ConvertFrom-Json -Depth 100
-}
-function Get-ValueArray($Response) {
-    if ($null -eq $Response) { return @() }
-    if ($Response.PSObject.Properties.Name -contains 'value') { return @($Response.value) }
-    return @($Response)
+function Assert-GraphSdkAvailable {
+    $required = @('Connect-MgGraph', 'Get-MgContext', 'Invoke-MgGraphRequest')
+    $missing = @($required | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+    if ($missing.Count -gt 0) {
+        try { Import-Module Microsoft.Graph.Authentication -ErrorAction Stop } catch {}
+        $missing = @($required | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+    }
+    if ($missing.Count -gt 0) {
+        throw "Microsoft Graph PowerShell SDK가 필요합니다. 누락 명령: $($missing -join ', '). 설치 예: Install-Module Microsoft.Graph -Scope CurrentUser"
+    }
 }
 
-if (-not (Get-Command mgc -ErrorAction SilentlyContinue)) {
-    throw 'mgc를 찾을 수 없습니다. Microsoft Graph CLI 설치 및 PATH 등록 후 다시 실행하십시오.'
+function Ensure-GraphConnection {
+    param([Parameter(Mandatory)][string[]]$Scopes)
+
+    Assert-GraphSdkAvailable
+    $ctx = Get-MgContext -ErrorAction SilentlyContinue
+    $currentScopes = if ($ctx) { @($ctx.Scopes) } else { @() }
+    $missingScopes = @($Scopes | Where-Object { $currentScopes -notcontains $_ })
+    if (-not $ctx -or -not $ctx.Account -or $missingScopes.Count -gt 0) {
+        if ($ctx) { try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {} }
+        Connect-MgGraph -Scopes $Scopes -UseDeviceCode -ContextScope Process -NoWelcome | Out-Null
+    }
 }
+
+function Get-GraphPropertyValue {
+    param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($key in $Object.Keys) {
+            if ([string]$key -ieq $Name) { return $Object[$key] }
+        }
+        return $null
+    }
+    $property = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $Name } | Select-Object -First 1
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function Get-GraphCollection {
+    param([Parameter(Mandatory)][string]$Uri)
+
+    $result = [System.Collections.Generic.List[object]]::new()
+    $next = $Uri
+    while (-not [string]::IsNullOrWhiteSpace([string]$next)) {
+        $response = Invoke-MgGraphRequest -Method GET -Uri $next -ErrorAction Stop
+        foreach ($entry in @(Get-GraphPropertyValue -Object $response -Name 'value')) { $result.Add($entry) }
+        $next = [string](Get-GraphPropertyValue -Object $response -Name '@odata.nextLink')
+    }
+    return @($result)
+}
+
+# Arbitrary drive inventory requires tenant-wide file read capability in the intended admin scenario.
+# Sites.Read.All is not additionally requested because Files.Read.All is sufficient for these DriveItem calls.
+Ensure-GraphConnection -Scopes @('Files.Read.All')
 
 $safe = ($TargetUserPrincipalName -replace '[^a-zA-Z0-9._-]', '_')
 $outDir = Join-Path $OutputRoot $safe
@@ -43,23 +77,31 @@ New-Item -ItemType Directory -Path $outDir -Force | Out-Null
 
 $errors = [System.Collections.Generic.List[object]]::new()
 $items = [System.Collections.Generic.List[object]]::new()
+$processedDriveItems = 0
+$pageTop = [Math]::Min(999, [Math]::Max(1, $MaxItems))
+$select = 'id,name,webUrl,folder,file,parentReference,createdDateTime,lastModifiedDateTime'
 
 try {
-    $rootChildren = Invoke-MgcJson -Arguments @('drives','with-drive-id','--drive-id',$DriveId,'root','children','list','--all','--top',[string]$MaxItems,'--select','id,name,webUrl,folder,file,parentReference,createdDateTime,lastModifiedDateTime')
+    $rootChildren = Get-GraphCollection -Uri "https://graph.microsoft.com/v1.0/drives/$DriveId/root/children?`$top=$pageTop&`$select=$select"
     $queue = [System.Collections.Generic.Queue[object]]::new()
-    foreach ($child in (Get-ValueArray $rootChildren)) { $queue.Enqueue($child) }
+    foreach ($child in $rootChildren) { $queue.Enqueue($child) }
 
-    while ($queue.Count -gt 0 -and $items.Count -lt $MaxItems) {
+    while ($queue.Count -gt 0 -and $processedDriveItems -lt $MaxItems) {
         $item = $queue.Dequeue()
-        $permissionResult = $null
+        $processedDriveItems++
+
+        $permissions = @()
         try {
-            $permissionResult = Invoke-MgcJson -Arguments @('drives','with-drive-id','--drive-id',$DriveId,'items','with-drive-item-id','--drive-item-id',$item.id,'permissions','list','--all')
+            $permissions = Get-GraphCollection -Uri "https://graph.microsoft.com/v1.0/drives/$DriveId/items/$($item.id)/permissions?`$top=999"
         }
         catch {
-            $errors.Add([pscustomobject]@{ scope="driveItem.permissions:$($item.id)"; message=$_.Exception.Message; remediation='Files.Read.All 또는 Sites.Read.All 계열 권한과 해당 Drive 접근 권한을 확인하십시오.' })
+            $errors.Add([pscustomobject]@{
+                scope = "driveItem.permissions:$($item.id)"
+                message = $_.Exception.Message
+                remediation = 'Files.Read.All 권한과 해당 Drive 접근 가능 여부를 확인하십시오.'
+            })
         }
 
-        $permissions = Get-ValueArray $permissionResult
         foreach ($permission in $permissions) {
             $roles = @($permission.roles) -join ','
             $grantees = @()
@@ -71,6 +113,7 @@ try {
                 if ($g.siteGroup?.displayName) { $grantees += "SiteGroup:$($g.siteGroup.displayName)" }
             }
             if ($permission.link?.scope) { $grantees += "Link:$($permission.link.scope)" }
+
             $items.Add([pscustomobject]@{
                 driveId = $DriveId
                 itemId = $item.id
@@ -86,29 +129,39 @@ try {
             })
         }
 
-        if ($item.folder -and $items.Count -lt $MaxItems) {
+        if ($item.folder -and $processedDriveItems -lt $MaxItems) {
             try {
-                $children = Invoke-MgcJson -Arguments @('drives','with-drive-id','--drive-id',$DriveId,'items','with-drive-item-id','--drive-item-id',$item.id,'children','list','--all','--top','200','--select','id,name,webUrl,folder,file,parentReference,createdDateTime,lastModifiedDateTime')
-                foreach ($child in (Get-ValueArray $children)) { $queue.Enqueue($child) }
+                $children = Get-GraphCollection -Uri "https://graph.microsoft.com/v1.0/drives/$DriveId/items/$($item.id)/children?`$top=200&`$select=$select"
+                foreach ($child in $children) { $queue.Enqueue($child) }
             }
             catch {
-                $errors.Add([pscustomobject]@{ scope="driveItem.children:$($item.id)"; message=$_.Exception.Message; remediation='폴더 탐색 권한 또는 API 제한을 확인하십시오.' })
+                $errors.Add([pscustomobject]@{
+                    scope = "driveItem.children:$($item.id)"
+                    message = $_.Exception.Message
+                    remediation = '폴더 탐색 권한, Graph 응답 또는 API 제한을 확인하십시오.'
+                })
             }
         }
     }
 }
 catch {
-    $errors.Add([pscustomobject]@{ scope='sharepointOneDrive.scopeInventory'; message=$_.Exception.Message; remediation='Drive ID, Graph 권한, mgc 로그인 상태를 확인하십시오.' })
+    $errors.Add([pscustomobject]@{
+        scope = 'sharepointOneDrive.scopeInventory'
+        message = $_.Exception.Message
+        remediation = 'Drive ID, Graph PowerShell 로그인 상태, Files.Read.All 권한을 확인하십시오.'
+    })
 }
 
 $result = [ordered]@{
-    schemaVersion = '0.1'
+    schemaVersion = '0.2'
     generatedAt = (Get-Date).ToUniversalTime().ToString('o')
     target = [ordered]@{ userPrincipalName = $TargetUserPrincipalName }
     collection = [ordered]@{
+        tool = 'Microsoft Graph PowerShell SDK'
         scopeType = $ScopeType
         driveId = $DriveId
         maxItems = $MaxItems
+        processedDriveItems = $processedDriveItems
         limitation = '지정 Drive 범위에서 탐지된 권한입니다. 대상 사용자가 접근 가능한 테넌트 전체 파일의 완전한 역추적 결과가 아닙니다.'
     }
     inventory = [ordered]@{
@@ -127,5 +180,5 @@ $items | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding utf8BOM
 
 Write-Host "완료: $jsonPath" -ForegroundColor Green
 Write-Host "요약: $csvPath" -ForegroundColor Green
-if ($items.Count -ge $MaxItems) { Write-Warning "MaxItems 한도에 도달했습니다. 결과는 부분 수집일 수 있습니다." }
+if ($processedDriveItems -ge $MaxItems) { Write-Warning "MaxItems 한도에 도달했습니다. 결과는 부분 수집일 수 있습니다." }
 if ($errors.Count -gt 0) { Write-Warning "일부 항목을 수집하지 못했습니다. JSON의 inventory.errors를 확인하십시오." }
