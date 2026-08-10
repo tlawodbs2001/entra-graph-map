@@ -3,13 +3,9 @@ param(
     [Parameter(Mandatory)]
     [ValidatePattern('^[^\s@]+@[^\s@]+\.[^\s@]+$')]
     [string]$UserPrincipalName,
-
     [string]$OutputRoot = 'C:\scripts\entra-access-inventory\output',
-
     [switch]$IncludeAzure,
-
     [switch]$IncludeTransitiveMembership,
-
     [switch]$SkipPim
 )
 
@@ -43,6 +39,7 @@ function Ensure-GraphConnection {
     $missingScopes = @($Scopes | Where-Object { $currentScopes -notcontains $_ })
 
     if (-not $ctx -or -not $ctx.Account -or $missingScopes.Count -gt 0) {
+        if ($ctx) { try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {} }
         Connect-MgGraph -Scopes $Scopes -UseDeviceCode -ContextScope Process -NoWelcome | Out-Null
     }
 }
@@ -68,9 +65,7 @@ function Invoke-GraphRequestSafe {
         [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Errors
     )
 
-    try {
-        return Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop
-    }
+    try { return Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop }
     catch {
         $Errors.Add([pscustomobject]@{
             scope = $Operation
@@ -91,14 +86,11 @@ function Invoke-GraphCollectionSafe {
     $items = [System.Collections.Generic.List[object]]::new()
     $next = $Uri
     try {
-        while ($next) {
+        while (-not [string]::IsNullOrWhiteSpace([string]$next)) {
             $response = Invoke-MgGraphRequest -Method GET -Uri $next -ErrorAction Stop
-            foreach ($item in @(Get-GraphPropertyValue -Object $response -Name 'value')) {
-                $items.Add($item)
-            }
+            foreach ($item in @(Get-GraphPropertyValue -Object $response -Name 'value')) { $items.Add($item) }
             $next = [string](Get-GraphPropertyValue -Object $response -Name '@odata.nextLink')
         }
-        return @($items)
     }
     catch {
         $Errors.Add([pscustomobject]@{
@@ -106,15 +98,15 @@ function Invoke-GraphCollectionSafe {
             message = $_.Exception.Message
             remediation = 'Graph PowerShell 로그인 상태, delegated 권한, Graph 페이징 응답을 확인하십시오.'
         })
-        return @($items)
     }
+    return @($items)
 }
 
 function Assert-AzPowerShellAvailable {
     $required = @('Get-AzContext', 'Connect-AzAccount', 'Get-AzSubscription', 'Set-AzContext', 'Get-AzRoleAssignment')
     $missing = @($required | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
     if ($missing.Count -gt 0) {
-        throw "Azure PowerShell 모듈이 필요합니다. 누락 명령: $($missing -join ', '). Az.Accounts와 Az.Resources 설치 여부를 확인하십시오."
+        throw "Azure PowerShell 모듈이 필요합니다. 누락 명령: $($missing -join ', '). 설치: Install-Module Az.Accounts,Az.Resources -Scope CurrentUser"
     }
 }
 
@@ -131,44 +123,29 @@ Ensure-GraphConnection -Scopes @($scopes | Select-Object -Unique)
 $encodedUpn = [uri]::EscapeDataString($UserPrincipalName)
 $user = Invoke-GraphRequestSafe `
     -Uri "https://graph.microsoft.com/v1.0/users/$encodedUpn?`$select=id,displayName,userPrincipalName,accountEnabled,createdDateTime,companyName,userType" `
-    -Operation 'entra.user' `
-    -Errors $errors
+    -Operation 'entra.user' -Errors $errors
 
 if ($null -eq $user -or [string]::IsNullOrWhiteSpace([string]$user.id)) {
-    $result = [ordered]@{
+    $failed = [ordered]@{
         schemaVersion = '0.2'
         generatedAt = (Get-Date).ToUniversalTime().ToString('o')
         target = [ordered]@{ userPrincipalName = $UserPrincipalName }
         collection = [ordered]@{ status = 'failed'; tool = 'Microsoft Graph PowerShell SDK'; errors = @($errors) }
         inventory = [ordered]@{ entra = @{}; azure = @{}; sharePointOneDrive = @{}; errors = @($errors) }
     }
-    $result | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath (Join-Path $outDir 'access-inventory.json') -Encoding utf8
+    $failed | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath (Join-Path $outDir 'access-inventory.json') -Encoding utf8
     throw "대상 사용자를 조회하지 못했습니다. 결과 파일: $outDir\access-inventory.json"
 }
 
 $userId = [string]$user.id
-$memberOf = Invoke-GraphCollectionSafe `
-    -Uri "https://graph.microsoft.com/v1.0/users/$userId/memberOf?`$top=999" `
-    -Operation 'entra.memberOf' -Errors $errors
-
+$memberOf = Invoke-GraphCollectionSafe -Uri "https://graph.microsoft.com/v1.0/users/$userId/memberOf?`$top=999" -Operation 'entra.memberOf' -Errors $errors
 $transitiveMemberOf = @()
 if ($IncludeTransitiveMembership) {
-    $transitiveMemberOf = Invoke-GraphCollectionSafe `
-        -Uri "https://graph.microsoft.com/v1.0/users/$userId/transitiveMemberOf?`$top=999" `
-        -Operation 'entra.transitiveMemberOf' -Errors $errors
+    $transitiveMemberOf = Invoke-GraphCollectionSafe -Uri "https://graph.microsoft.com/v1.0/users/$userId/transitiveMemberOf?`$top=999" -Operation 'entra.transitiveMemberOf' -Errors $errors
 }
-
-$ownedObjects = Invoke-GraphCollectionSafe `
-    -Uri "https://graph.microsoft.com/v1.0/users/$userId/ownedObjects?`$top=999" `
-    -Operation 'entra.ownedObjects' -Errors $errors
-
-$appRoleAssignments = Invoke-GraphCollectionSafe `
-    -Uri "https://graph.microsoft.com/v1.0/users/$userId/appRoleAssignments?`$top=999" `
-    -Operation 'entra.appRoleAssignments' -Errors $errors
-
-$drive = Invoke-GraphRequestSafe `
-    -Uri "https://graph.microsoft.com/v1.0/users/$userId/drive?`$select=id,driveType,webUrl,quota,owner" `
-    -Operation 'onedrive.drive' -Errors $errors
+$ownedObjects = Invoke-GraphCollectionSafe -Uri "https://graph.microsoft.com/v1.0/users/$userId/ownedObjects?`$top=999" -Operation 'entra.ownedObjects' -Errors $errors
+$appRoleAssignments = Invoke-GraphCollectionSafe -Uri "https://graph.microsoft.com/v1.0/users/$userId/appRoleAssignments?`$top=999" -Operation 'entra.appRoleAssignments' -Errors $errors
+$drive = Invoke-GraphRequestSafe -Uri "https://graph.microsoft.com/v1.0/users/$userId/drive?`$select=id,driveType,webUrl,quota,owner" -Operation 'onedrive.drive' -Errors $errors
 
 $pimActive = @()
 if (-not $SkipPim) {
@@ -185,9 +162,7 @@ if ($IncludeAzure) {
     try {
         Assert-AzPowerShellAvailable
         $azContext = Get-AzContext -ErrorAction SilentlyContinue
-        if (-not $azContext -or -not $azContext.Account) {
-            Connect-AzAccount -ErrorAction Stop | Out-Null
-        }
+        if (-not $azContext -or -not $azContext.Account) { Connect-AzAccount -ErrorAction Stop | Out-Null }
 
         $subscriptions = @(Get-AzSubscription -ErrorAction Stop | Where-Object { $_.State -eq 'Enabled' })
         $azureCollection.status = 'completed'
@@ -201,7 +176,9 @@ if ($IncludeAzure) {
                     tenantId = [string]$subscription.TenantId
                 }
 
-                $assignments = @(Get-AzRoleAssignment -ObjectId $userId -Scope "/subscriptions/$subId" -ErrorAction Stop)
+                # Selected subscription context + ObjectId returns assignments under the subscription;
+                # do not constrain -Scope here, because resource-group/resource-level assignments must also be included.
+                $assignments = @(Get-AzRoleAssignment -ObjectId $userId -ErrorAction Stop)
                 foreach ($item in $assignments) {
                     $azureAssignments += [pscustomobject]@{
                         subscriptionId = $subId
@@ -265,11 +242,11 @@ $result = [ordered]@{
     }
     inventory = [ordered]@{
         entra = [ordered]@{
-            directMembership = @($directMembership)
-            transitiveMembership = @($transitiveMembership)
-            ownedObjects = @($owners)
-            appRoleAssignments = @($appRoles)
-            pimActiveRoleAssignments = @($pim)
+            directMembership = $directMembership
+            transitiveMembership = $transitiveMembership
+            ownedObjects = $owners
+            appRoleAssignments = $appRoles
+            pimActiveRoleAssignments = $pim
         }
         azure = $azureCollection
         sharePointOneDrive = [ordered]@{
