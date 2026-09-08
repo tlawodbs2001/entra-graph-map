@@ -72,11 +72,10 @@ function Get-GraphErrorInfo {
     $statusCode = $null
     $retryAfter = $null
     $errorCode = $null
-    $message = $_.Exception.Message
-    try { $message = [string](Get-GraphPropertyValue -Object (Get-GraphPropertyValue -Object $ErrorRecord -Name 'Exception') -Name 'Message' -Default $message) } catch {}
+    $exception = Get-GraphPropertyValue -Object $ErrorRecord -Name 'Exception'
+    $message = [string](Get-GraphPropertyValue -Object $exception -Name 'Message' -Default 'Unknown Graph error')
 
     try {
-        $exception = Get-GraphPropertyValue -Object $ErrorRecord -Name 'Exception'
         $response = Get-GraphPropertyValue -Object $exception -Name 'Response'
         $status = Get-GraphPropertyValue -Object $response -Name 'StatusCode'
         if ($null -eq $status) { $status = Get-GraphPropertyValue -Object $exception -Name 'ResponseStatusCode' }
@@ -213,7 +212,8 @@ function Invoke-GraphCollectionSafe {
     }
     catch {
         $info = Get-GraphErrorInfo -ErrorRecord $_
-        Add-GraphInventoryError -Errors $Errors -Operation $Operation -Uri ([string]$next) -Page $page -Message $info.Message -StatusCode $info.StatusCode -ErrorCode $info.ErrorCode -Remediation 'Graph 로그인/권한, 응답 구조, pagination 상태를 확인하십시오. 반환 결과는 부분 수집일 수 있습니다.'
+        $errorUri = if ([string]::IsNullOrWhiteSpace([string]$next)) { $Uri } else { [string]$next }
+        Add-GraphInventoryError -Errors $Errors -Operation $Operation -Uri $errorUri -Page $page -Message $info.Message -StatusCode $info.StatusCode -ErrorCode $info.ErrorCode -Remediation 'Graph 로그인/권한, 응답 구조, pagination 상태를 확인하십시오. 반환 결과는 부분 수집일 수 있습니다.'
     }
     return @($items)
 }
@@ -399,7 +399,7 @@ foreach ($entry in $azureAssignments) {
     $summary.Add([pscustomobject]@{ Category='Azure RBAC'; Item=$entry.subscriptionName; Name=$entry.roleName; Detail=$entry.scope; Level=$(if($entry.isOwner){'Owner'}else{'Assigned'}) })
 }
 
-@($summary) | Export-Csv -LiteralPath (Join-Path $outDir 'access-inventory-summary.csv') -NoTypeInformation -Encoding utf8BOM
+$summary.ToArray() | Export-Csv -LiteralPath (Join-Path $outDir 'access-inventory-summary.csv') -NoTypeInformation -Encoding utf8BOM
 
 Write-Host "완료: $jsonPath" -ForegroundColor Green
 Write-Host "요약: $(Join-Path $outDir 'access-inventory-summary.csv')" -ForegroundColor Green
