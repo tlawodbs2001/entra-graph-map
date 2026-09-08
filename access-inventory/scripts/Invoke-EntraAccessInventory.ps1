@@ -30,32 +30,142 @@ function Assert-GraphSdkAvailable {
     }
 }
 
+function Get-GraphPropertyResult {
+    param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return [pscustomobject]@{ Exists=$false; Value=$null } }
+    if ($Object -is [System.Collections.IDictionary]) {
+        foreach ($key in $Object.Keys) {
+            if ([string]$key -ieq $Name) { return [pscustomobject]@{ Exists=$true; Value=$Object[$key] } }
+        }
+        return [pscustomobject]@{ Exists=$false; Value=$null }
+    }
+    $property = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $Name } | Select-Object -First 1
+    if ($property) { return [pscustomobject]@{ Exists=$true; Value=$property.Value } }
+    return [pscustomobject]@{ Exists=$false; Value=$null }
+}
+
+function Get-GraphPropertyValue {
+    param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name, [AllowNull()]$Default=$null)
+    $result = Get-GraphPropertyResult -Object $Object -Name $Name
+    if ($result.Exists) { return $result.Value }
+    return $Default
+}
+
 function Ensure-GraphConnection {
     param([Parameter(Mandatory)][string[]]$Scopes)
 
     Assert-GraphSdkAvailable
     $ctx = Get-MgContext -ErrorAction SilentlyContinue
-    $currentScopes = if ($ctx) { @($ctx.Scopes) } else { @() }
+    $currentScopes = if ($ctx) { @((Get-GraphPropertyValue -Object $ctx -Name 'Scopes')) } else { @() }
+    $account = Get-GraphPropertyValue -Object $ctx -Name 'Account'
     $missingScopes = @($Scopes | Where-Object { $currentScopes -notcontains $_ })
 
-    if (-not $ctx -or -not $ctx.Account -or $missingScopes.Count -gt 0) {
+    if (-not $ctx -or -not $account -or $missingScopes.Count -gt 0) {
         if ($ctx) { try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {} }
         Connect-MgGraph -Scopes $Scopes -UseDeviceCode -ContextScope Process -NoWelcome | Out-Null
     }
 }
 
-function Get-GraphPropertyValue {
-    param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name)
-    if ($null -eq $Object) { return $null }
-    if ($Object -is [System.Collections.IDictionary]) {
-        foreach ($key in $Object.Keys) {
-            if ([string]$key -ieq $Name) { return $Object[$key] }
+function Get-GraphErrorInfo {
+    param([Parameter(Mandatory)]$ErrorRecord)
+
+    $statusCode = $null
+    $retryAfter = $null
+    $errorCode = $null
+    $message = $_.Exception.Message
+    try { $message = [string](Get-GraphPropertyValue -Object (Get-GraphPropertyValue -Object $ErrorRecord -Name 'Exception') -Name 'Message' -Default $message) } catch {}
+
+    try {
+        $exception = Get-GraphPropertyValue -Object $ErrorRecord -Name 'Exception'
+        $response = Get-GraphPropertyValue -Object $exception -Name 'Response'
+        $status = Get-GraphPropertyValue -Object $response -Name 'StatusCode'
+        if ($null -eq $status) { $status = Get-GraphPropertyValue -Object $exception -Name 'ResponseStatusCode' }
+        if ($null -ne $status) { $statusCode = [int]$status }
+
+        $headers = Get-GraphPropertyValue -Object $response -Name 'Headers'
+        if ($null -eq $headers) { $headers = Get-GraphPropertyValue -Object $exception -Name 'ResponseHeaders' }
+        if ($headers -and ($headers.PSObject.Methods.Name -contains 'TryGetValues')) {
+            [System.Collections.Generic.IEnumerable[string]]$values = $null
+            if ($headers.TryGetValues('Retry-After',[ref]$values)) {
+                [int]$parsed = 0
+                $first = @($values) | Select-Object -First 1
+                if ($first -and [int]::TryParse([string]$first,[ref]$parsed)) { $retryAfter = $parsed }
+            }
         }
-        return $null
+        elseif ($headers -is [System.Collections.IDictionary]) {
+            [int]$parsed = 0
+            $value = Get-GraphPropertyValue -Object $headers -Name 'Retry-After'
+            if ($value -and [int]::TryParse([string]$value,[ref]$parsed)) { $retryAfter = $parsed }
+        }
+    } catch {}
+
+    if ($null -eq $statusCode) {
+        if ($message -match '\b(401|403|404|408|409|429|500|502|503|504)\b') { $statusCode = [int]$Matches[1] }
+        elseif ($message -match 'TooManyRequests|Too Many Requests|throttl') { $statusCode = 429 }
+        elseif ($message -match 'Authorization_RequestDenied|Insufficient privileges|Forbidden') { $statusCode = 403 }
+        elseif ($message -match 'Unauthorized|invalid.*token|expired.*token') { $statusCode = 401 }
     }
-    $property = $Object.PSObject.Properties | Where-Object { $_.Name -ieq $Name } | Select-Object -First 1
-    if ($property) { return $property.Value }
-    return $null
+
+    try {
+        $details = Get-GraphPropertyValue -Object $ErrorRecord -Name 'ErrorDetails'
+        $raw = Get-GraphPropertyValue -Object $details -Name 'Message'
+        if (-not [string]::IsNullOrWhiteSpace([string]$raw)) {
+            $parsed = ([string]$raw | ConvertFrom-Json -ErrorAction Stop)
+            $inner = Get-GraphPropertyValue -Object $parsed -Name 'error'
+            $code = Get-GraphPropertyValue -Object $inner -Name 'code'
+            $graphMessage = Get-GraphPropertyValue -Object $inner -Name 'message'
+            if ($code) { $errorCode = [string]$code }
+            if ($graphMessage) { $message = [string]$graphMessage }
+        }
+    } catch {}
+
+    return [pscustomobject]@{ StatusCode=$statusCode; RetryAfter=$retryAfter; ErrorCode=$errorCode; Message=$message }
+}
+
+function Invoke-GraphGetWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [int]$MaxAttempts = 5
+    )
+
+    if ($MaxAttempts -lt 1) { throw 'MaxAttempts는 1 이상이어야 합니다.' }
+
+    for ($attempt=1; $attempt -le $MaxAttempts; $attempt++) {
+        try { return Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop }
+        catch {
+            $info = Get-GraphErrorInfo -ErrorRecord $_
+            $transientText = $info.Message -match 'timeout|temporar|connection.*reset|connection.*closed'
+            $retryable = ($info.StatusCode -eq 429) -or ($info.StatusCode -in @(408,500,502,503,504)) -or ($null -eq $info.StatusCode -and $transientText)
+            if (-not $retryable -or $attempt -ge $MaxAttempts) { throw }
+
+            $delay = if ($info.RetryAfter -and $info.RetryAfter -gt 0) { [Math]::Min([int]$info.RetryAfter,120) }
+                else { [int][Math]::Min([Math]::Pow(2,$attempt),30) }
+            Start-Sleep -Seconds $delay
+        }
+    }
+}
+
+function Add-GraphInventoryError {
+    param(
+        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Errors,
+        [Parameter(Mandatory)][string]$Operation,
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][string]$Message,
+        [string]$Remediation,
+        [Nullable[int]]$Page,
+        [Nullable[int]]$StatusCode,
+        [string]$ErrorCode
+    )
+
+    $Errors.Add([pscustomobject]@{
+        scope = $Operation
+        uri = $Uri
+        page = $Page
+        statusCode = $StatusCode
+        errorCode = $ErrorCode
+        message = $Message
+        remediation = $Remediation
+    })
 }
 
 function Invoke-GraphRequestSafe {
@@ -65,13 +175,10 @@ function Invoke-GraphRequestSafe {
         [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Errors
     )
 
-    try { return Invoke-MgGraphRequest -Method GET -Uri $Uri -ErrorAction Stop }
+    try { return Invoke-GraphGetWithRetry -Uri $Uri }
     catch {
-        $Errors.Add([pscustomobject]@{
-            scope = $Operation
-            message = $_.Exception.Message
-            remediation = 'Graph PowerShell 로그인 상태, delegated 권한, 대상 객체 존재 여부를 확인하십시오.'
-        })
+        $info = Get-GraphErrorInfo -ErrorRecord $_
+        Add-GraphInventoryError -Errors $Errors -Operation $Operation -Uri $Uri -Message $info.Message -StatusCode $info.StatusCode -ErrorCode $info.ErrorCode -Remediation 'Graph PowerShell 로그인 상태, delegated 권한, 대상 객체 존재 여부를 확인하십시오.'
         return $null
     }
 }
@@ -80,24 +187,33 @@ function Invoke-GraphCollectionSafe {
     param(
         [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][string]$Operation,
-        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Errors
+        [Parameter(Mandatory)][System.Collections.Generic.List[object]]$Errors,
+        [int]$MaxPages = 10000
     )
 
     $items = [System.Collections.Generic.List[object]]::new()
     $next = $Uri
+    $page = 0
+    $seenLinks = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
     try {
         while (-not [string]::IsNullOrWhiteSpace([string]$next)) {
-            $response = Invoke-MgGraphRequest -Method GET -Uri $next -ErrorAction Stop
-            foreach ($item in @(Get-GraphPropertyValue -Object $response -Name 'value')) { $items.Add($item) }
+            if ($page -ge $MaxPages) { throw "MaxPages($MaxPages)를 초과했습니다. URI=$next" }
+            $page++
+            if (-not $seenLinks.Add([string]$next)) { throw "동일한 @odata.nextLink가 반복되었습니다. URI=$next" }
+
+            $response = Invoke-GraphGetWithRetry -Uri $next
+            if ($null -eq $response) { throw "Graph 응답이 null입니다. page=$page" }
+
+            $valueResult = Get-GraphPropertyResult -Object $response -Name 'value'
+            if (-not $valueResult.Exists) { throw "Collection 응답에 value 배열이 없습니다. page=$page type=$($response.GetType().FullName)" }
+            foreach ($item in @($valueResult.Value)) { if ($null -ne $item) { $items.Add($item) } }
             $next = [string](Get-GraphPropertyValue -Object $response -Name '@odata.nextLink')
         }
     }
     catch {
-        $Errors.Add([pscustomobject]@{
-            scope = $Operation
-            message = $_.Exception.Message
-            remediation = 'Graph PowerShell 로그인 상태, delegated 권한, Graph 페이징 응답을 확인하십시오.'
-        })
+        $info = Get-GraphErrorInfo -ErrorRecord $_
+        Add-GraphInventoryError -Errors $Errors -Operation $Operation -Uri ([string]$next) -Page $page -Message $info.Message -StatusCode $info.StatusCode -ErrorCode $info.ErrorCode -Remediation 'Graph 로그인/권한, 응답 구조, pagination 상태를 확인하십시오. 반환 결과는 부분 수집일 수 있습니다.'
     }
     return @($items)
 }
@@ -121,13 +237,13 @@ if (-not $SkipPim) { $scopes.Add('RoleManagement.Read.Directory') }
 Ensure-GraphConnection -Scopes @($scopes | Select-Object -Unique)
 
 $encodedUpn = [uri]::EscapeDataString($UserPrincipalName)
-$user = Invoke-GraphRequestSafe `
-    -Uri "https://graph.microsoft.com/v1.0/users/$encodedUpn?`$select=id,displayName,userPrincipalName,accountEnabled,createdDateTime,companyName,userType" `
-    -Operation 'entra.user' -Errors $errors
+$userUri = "https://graph.microsoft.com/v1.0/users/$encodedUpn?`$select=id,displayName,userPrincipalName,accountEnabled,createdDateTime,companyName,userType"
+$user = Invoke-GraphRequestSafe -Uri $userUri -Operation 'entra.user' -Errors $errors
+$userId = [string](Get-GraphPropertyValue -Object $user -Name 'id')
 
-if ($null -eq $user -or [string]::IsNullOrWhiteSpace([string]$user.id)) {
+if ($null -eq $user -or [string]::IsNullOrWhiteSpace($userId)) {
     $failed = [ordered]@{
-        schemaVersion = '0.2'
+        schemaVersion = '0.3'
         generatedAt = (Get-Date).ToUniversalTime().ToString('o')
         target = [ordered]@{ userPrincipalName = $UserPrincipalName }
         collection = [ordered]@{ status = 'failed'; tool = 'Microsoft Graph PowerShell SDK'; errors = @($errors) }
@@ -137,7 +253,6 @@ if ($null -eq $user -or [string]::IsNullOrWhiteSpace([string]$user.id)) {
     throw "대상 사용자를 조회하지 못했습니다. 결과 파일: $outDir\access-inventory.json"
 }
 
-$userId = [string]$user.id
 $memberOf = Invoke-GraphCollectionSafe -Uri "https://graph.microsoft.com/v1.0/users/$userId/memberOf?`$top=999" -Operation 'entra.memberOf' -Errors $errors
 $transitiveMemberOf = @()
 if ($IncludeTransitiveMembership) {
@@ -151,9 +266,7 @@ $pimActive = @()
 if (-not $SkipPim) {
     $filter = [uri]::EscapeDataString("principalId eq '$userId'")
     $expand = [uri]::EscapeDataString('roleDefinition($select=id,displayName)')
-    $pimActive = Invoke-GraphCollectionSafe `
-        -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances?`$filter=$filter&`$expand=$expand&`$top=999" `
-        -Operation 'entra.pimActive' -Errors $errors
+    $pimActive = Invoke-GraphCollectionSafe -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances?`$filter=$filter&`$expand=$expand&`$top=999" -Operation 'entra.pimActive' -Errors $errors
 }
 
 $azureAssignments = @()
@@ -176,8 +289,6 @@ if ($IncludeAzure) {
                     tenantId = [string]$subscription.TenantId
                 }
 
-                # Selected subscription context + ObjectId returns assignments under the subscription;
-                # do not constrain -Scope here, because resource-group/resource-level assignments must also be included.
                 $assignments = @(Get-AzRoleAssignment -ObjectId $userId -ErrorAction Stop)
                 foreach ($item in $assignments) {
                     $azureAssignments += [pscustomobject]@{
@@ -195,6 +306,10 @@ if ($IncludeAzure) {
             catch {
                 $errors.Add([pscustomobject]@{
                     scope = "azure.rbac.$($subscription.Id)"
+                    uri = ''
+                    page = $null
+                    statusCode = $null
+                    errorCode = 'AzureRoleAssignmentFailed'
                     message = $_.Exception.Message
                     remediation = '해당 구독 컨텍스트와 Reader 이상 조회 권한, Az.Resources 모듈 상태를 확인하십시오.'
                 })
@@ -206,6 +321,10 @@ if ($IncludeAzure) {
         $azureCollection.status = 'partialOrFailed'
         $errors.Add([pscustomobject]@{
             scope = 'azure.rbac'
+            uri = ''
+            page = $null
+            statusCode = $null
+            errorCode = 'AzureCollectionFailed'
             message = $_.Exception.Message
             remediation = 'Azure PowerShell 로그인, Az.Accounts/Az.Resources 모듈, 구독 조회 권한을 확인하십시오.'
         })
@@ -219,19 +338,19 @@ $appRoles = @($appRoleAssignments)
 $pim = @($pimActive)
 
 $result = [ordered]@{
-    schemaVersion = '0.2'
+    schemaVersion = '0.3'
     generatedAt = (Get-Date).ToUniversalTime().ToString('o')
     target = [ordered]@{
-        id = $user.id
-        displayName = $user.displayName
-        userPrincipalName = $user.userPrincipalName
-        userType = $user.userType
-        companyName = $user.companyName
-        accountEnabled = $user.accountEnabled
-        createdDateTime = $user.createdDateTime
+        id = $userId
+        displayName = Get-GraphPropertyValue -Object $user -Name 'displayName'
+        userPrincipalName = Get-GraphPropertyValue -Object $user -Name 'userPrincipalName'
+        userType = Get-GraphPropertyValue -Object $user -Name 'userType'
+        companyName = Get-GraphPropertyValue -Object $user -Name 'companyName'
+        accountEnabled = Get-GraphPropertyValue -Object $user -Name 'accountEnabled'
+        createdDateTime = Get-GraphPropertyValue -Object $user -Name 'createdDateTime'
     }
     collection = [ordered]@{
-        status = 'completedWithPossiblePartialResults'
+        status = $(if ($errors.Count -gt 0) { 'completedWithPartialResults' } else { 'completed' })
         tool = 'Microsoft Graph PowerShell SDK + optional Azure PowerShell'
         flags = [ordered]@{
             includeAzure = [bool]$IncludeAzure
@@ -239,6 +358,7 @@ $result = [ordered]@{
             skipPim = [bool]$SkipPim
         }
         outputDirectory = $outDir
+        errorCount = $errors.Count
     }
     inventory = [ordered]@{
         entra = [ordered]@{
@@ -260,16 +380,26 @@ $result = [ordered]@{
 $jsonPath = Join-Path $outDir 'access-inventory.json'
 $result | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $jsonPath -Encoding utf8
 
-$summary = @(
-    [pscustomobject]@{ Category='Target'; Item='User'; Name=$user.displayName; Detail=$user.userPrincipalName; Level='N/A' }
-    $directMembership | ForEach-Object { [pscustomobject]@{ Category='Entra direct membership'; Item=$_.'@odata.type'; Name=$_.displayName; Detail=$_.id; Level='Direct' } }
-    $pim | ForEach-Object { [pscustomobject]@{ Category='PIM active'; Item='Directory role'; Name=$_.roleDefinition.displayName; Detail=$_.directoryScopeId; Level='Active' } }
-    $owners | ForEach-Object { [pscustomobject]@{ Category='Owned object'; Item=$_.'@odata.type'; Name=$_.displayName; Detail=$_.id; Level='Owner' } }
-    $appRoles | ForEach-Object { [pscustomobject]@{ Category='Enterprise app'; Item=$_.resourceDisplayName; Name=$_.appRoleId; Detail=$_.resourceId; Level='Assigned' } }
-    $azureAssignments | ForEach-Object { [pscustomobject]@{ Category='Azure RBAC'; Item=$_.subscriptionName; Name=$_.roleName; Detail=$_.scope; Level=if($_.isOwner){'Owner'}else{'Assigned'} } }
-)
+$summary = [System.Collections.Generic.List[object]]::new()
+$summary.Add([pscustomobject]@{ Category='Target'; Item='User'; Name=(Get-GraphPropertyValue -Object $user -Name 'displayName'); Detail=(Get-GraphPropertyValue -Object $user -Name 'userPrincipalName'); Level='N/A' })
+foreach ($entry in $directMembership) {
+    $summary.Add([pscustomobject]@{ Category='Entra direct membership'; Item=(Get-GraphPropertyValue -Object $entry -Name '@odata.type'); Name=(Get-GraphPropertyValue -Object $entry -Name 'displayName'); Detail=(Get-GraphPropertyValue -Object $entry -Name 'id'); Level='Direct' })
+}
+foreach ($entry in $pim) {
+    $roleDefinition = Get-GraphPropertyValue -Object $entry -Name 'roleDefinition'
+    $summary.Add([pscustomobject]@{ Category='PIM active'; Item='Directory role'; Name=(Get-GraphPropertyValue -Object $roleDefinition -Name 'displayName'); Detail=(Get-GraphPropertyValue -Object $entry -Name 'directoryScopeId'); Level='Active' })
+}
+foreach ($entry in $owners) {
+    $summary.Add([pscustomobject]@{ Category='Owned object'; Item=(Get-GraphPropertyValue -Object $entry -Name '@odata.type'); Name=(Get-GraphPropertyValue -Object $entry -Name 'displayName'); Detail=(Get-GraphPropertyValue -Object $entry -Name 'id'); Level='Owner' })
+}
+foreach ($entry in $appRoles) {
+    $summary.Add([pscustomobject]@{ Category='Enterprise app'; Item=(Get-GraphPropertyValue -Object $entry -Name 'resourceDisplayName'); Name=(Get-GraphPropertyValue -Object $entry -Name 'appRoleId'); Detail=(Get-GraphPropertyValue -Object $entry -Name 'resourceId'); Level='Assigned' })
+}
+foreach ($entry in $azureAssignments) {
+    $summary.Add([pscustomobject]@{ Category='Azure RBAC'; Item=$entry.subscriptionName; Name=$entry.roleName; Detail=$entry.scope; Level=$(if($entry.isOwner){'Owner'}else{'Assigned'}) })
+}
 
-$summary | Export-Csv -LiteralPath (Join-Path $outDir 'access-inventory-summary.csv') -NoTypeInformation -Encoding utf8BOM
+@($summary) | Export-Csv -LiteralPath (Join-Path $outDir 'access-inventory-summary.csv') -NoTypeInformation -Encoding utf8BOM
 
 Write-Host "완료: $jsonPath" -ForegroundColor Green
 Write-Host "요약: $(Join-Path $outDir 'access-inventory-summary.csv')" -ForegroundColor Green
